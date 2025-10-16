@@ -1,106 +1,78 @@
 import os
-import json
-from flask import Request, jsonify
-from googleapiclient import discovery
-from google.oauth2 import service_account
-import google.auth
+from flask import Flask, jsonify, render_template_string
+from google.cloud import compute_v1
 
-PROJECT = os.environ.get("GCP_PROJECT")
+app = Flask(__name__)
 
-# Use default credentials in Cloud Functions
-credentials, _ = google.auth.default()
+# ---------- Simple HTML UI ----------
+TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>GCP Security Audit Report</title>
+<style>
+body { font-family: Arial, sans-serif; background: #f4f4f9; padding: 20px; }
+h1 { color: #2b5cd6; }
+table { border-collapse: collapse; width: 100%; background: white; }
+th, td { padding: 10px; border-bottom: 1px solid #ddd; text-align: left; }
+th { background: #2b5cd6; color: white; }
+</style>
+</head>
+<body>
+<h1>🔒 GCP Security Audit Report</h1>
+<p><b>Project:</b> {{ project }}</p>
+<p><b>Findings:</b></p>
+<table>
+<tr><th>Resource</th><th>Finding</th></tr>
+{% for f in findings %}
+<tr><td>{{ f['resource'] }}</td><td>{{ f['finding'] }}</td></tr>
+{% endfor %}
+</table>
+</body>
+</html>
+"""
 
-def list_compute_instances():
-    compute = discovery.build('compute', 'v1', credentials=credentials, cache_discovery=False)
-    zones_req = compute.zones().list(project=PROJECT)
-    zones = []
+# ---------- Security Scan Logic ----------
+def scan_resources(project_id):
+    findings = []
     try:
-        while zones_req is not None:
-            zones_resp = zones_req.execute()
-            for z in zones_resp.get('items', []):
-                zones.append(z['name'])
-            zones_req = compute.zones().list_next(previous_request=zones_req, previous_response=zones_resp)
-    except Exception:
-        pass
+        compute_client = compute_v1.InstancesClient()
+        zones = ["us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f"]
+        for zone in zones:
+            try:
+                request = compute_v1.ListInstancesRequest(project=project_id, zone=zone)
+                for instance in compute_client.list(request=request):
+                    if instance.network_interfaces:
+                        for iface in instance.network_interfaces:
+                            if iface.access_configs:
+                                findings.append({
+                                    "resource": instance.name,
+                                    "finding": f"VM '{instance.name}' in {zone} has a public IP"
+                                })
+            except Exception as inner_e:
+                continue
+    except Exception as e:
+        findings.append({"resource": "Compute Engine", "finding": f"Error during scan: {e}"})
 
-    instances = []
-    for zone in zones:
-        try:
-            resp = compute.instances().list(project=PROJECT, zone=zone).execute()
-            for inst in resp.get('items', []):
-                instances.append({
-                    "name": inst.get("name"),
-                    "zone": zone,
-                    "networkInterfaces": inst.get("networkInterfaces", [])
-                })
-        except Exception:
-            continue
-    return instances
+    if not findings:
+        findings.append({"resource": "All", "finding": "✅ No public IPs found"})
 
-def list_gke_clusters():
-    try:
-        container = discovery.build('container', 'v1', credentials=credentials, cache_discovery=False)
-        resp = container.projects().zones().clusters().list(projectId=PROJECT, zone='-').execute()
-        clusters = resp.get('clusters', []) if resp else []
-        return clusters
-    except Exception:
-        return []
+    return findings
 
-def list_sql_instances():
-    try:
-        sqladmin = discovery.build('sqladmin', 'v1beta4', credentials=credentials, cache_discovery=False)
-        resp = sqladmin.instances().list(project=PROJECT).execute()
-        return resp.get('items', [])
-    except Exception:
-        return []
+# ---------- Routes ----------
+@app.route('/')
+def home():
+    project_id = os.environ.get("GCP_PROJECT", "unknown")
+    findings = scan_resources(project_id)
+    return render_template_string(TEMPLATE, project=project_id, findings=findings)
 
-def list_buckets():
-    try:
-        storage = discovery.build('storage', 'v1', credentials=credentials, cache_discovery=False)
-        resp = storage.buckets().list(project=PROJECT).execute()
-        return resp.get('items', [])
-    except Exception:
-        return []
+@app.route('/run')
+def run_scan():
+    """Endpoint for Cloud Scheduler"""
+    project_id = os.environ.get("GCP_PROJECT", "unknown")
+    findings = scan_resources(project_id)
+    return jsonify(findings)
 
-def audit_handler(request: Request):
-    findings = {}
-
-    # Compute
-    instances = list_compute_instances()
-    # find public external IPs
-    public_vms = []
-    for i in instances:
-        for ni in i.get("networkInterfaces", []):
-            for ac in ni.get("accessConfigs", []) if ni.get("accessConfigs") else []:
-                if ac.get("natIP"):
-                    public_vms.append({"name": i.get("name"), "ip": ac.get("natIP")})
-    findings['public_vms'] = public_vms
-    findings['compute_instances_total'] = len(instances)
-
-    # GKE
-    clusters = list_gke_clusters()
-    # check nodes with public IPs is more involved — you can extend to call GKE API / compute API
-    findings['gke_clusters'] = [{"name": c.get("name"), "endpoint": c.get("endpoint")} for c in clusters]
-
-    # Cloud SQL
-    sqls = list_sql_instances()
-    public_sqls = [s for s in sqls if s.get("ipAddresses")]
-    findings['cloud_sql_total'] = len(sqls)
-    findings['cloud_sql_with_ips'] = len(public_sqls)
-
-    # Buckets
-    buckets = list_buckets()
-    public_buckets = []
-    for b in buckets:
-        # naive check for "allUsers" in IAM will require separate call, here we fetch ACL (cheap)
-        if 'iamConfiguration' in b and b['iamConfiguration'].get('publicAccessPrevention') == 'unspecified':
-            # not definitive — suggest using storage.buckets.getIamPolicy
-            public_buckets.append(b.get('name'))
-    findings['buckets_total'] = len(buckets)
-    findings['buckets_suspected_public'] = public_buckets
-
-    # TODO: check service accounts with owner role (use cloudresourcemanager or iam)
-    # TODO: check bucket IAMs for allUsers/allAuthenticatedUsers
-    # TODO: check firewall rules allowing 0.0.0.0/0 to sensitive ports
-
-    return jsonify({"project": PROJECT, "findings": findings})
+def main(request):
+    """Cloud Function entrypoint"""
+    return home()
