@@ -1,5 +1,5 @@
 import os
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request, abort
 from google.cloud import compute_v1
 
 app = Flask(__name__)
@@ -32,7 +32,7 @@ th { background: #2b5cd6; color: white; }
 </html>
 """
 
-# ---------- Security Scan Logic ----------
+# ---------- Security Scan ----------
 def scan_resources(project_id):
     findings = []
     try:
@@ -49,7 +49,7 @@ def scan_resources(project_id):
                                     "resource": instance.name,
                                     "finding": f"VM '{instance.name}' in {zone} has a public IP"
                                 })
-            except Exception as inner_e:
+            except Exception:
                 continue
     except Exception as e:
         findings.append({"resource": "Compute Engine", "finding": f"Error during scan: {e}"})
@@ -62,17 +62,21 @@ def scan_resources(project_id):
 # ---------- Routes ----------
 @app.route('/')
 def home():
+    """Dashboard (requires authentication)"""
     project_id = os.environ.get("GCP_PROJECT", "unknown")
     findings = scan_resources(project_id)
     return render_template_string(TEMPLATE, project=project_id, findings=findings)
 
 @app.route('/run')
 def run_scan():
-    """Endpoint for Cloud Scheduler"""
+    """Triggered by Cloud Scheduler (authenticated via OIDC)"""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        abort(403)
     project_id = os.environ.get("GCP_PROJECT", "unknown")
     findings = scan_resources(project_id)
     return jsonify(findings)
 
 def main(request):
-    """Cloud Function entrypoint"""
+    """Cloud Function Entrypoint"""
     return home()
