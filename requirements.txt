@@ -4,7 +4,7 @@ google-auth==2.22.0
 google-cloud-storage==2.14.0
 google-cloud-compute==1.14.1
 google-cloud-container==2.27.0
-google-cloud-sql==1.1.0
 google-cloud-logging==3.8.0
 google-cloud-secret-manager==2.16.2
 google-cloud-pubsub==2.21.0
+
